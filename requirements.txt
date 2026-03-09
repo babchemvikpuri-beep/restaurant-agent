@@ -1,6 +1,6 @@
 fastapi
 uvicorn
-pydantic
-python-dotenv
-requests
-openai
+sentence-transformers
+faiss-cpu
+overpy
+numpy
