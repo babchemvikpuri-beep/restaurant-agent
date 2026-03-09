@@ -1,47 +1,106 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
-
-load_dotenv()
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from fastapi import FastAPI, Form, HTTPException
+import overpy, math
+from sentence_transformers import SentenceTransformer
+import numpy as np, faiss
 
 app = FastAPI()
 
-class Query(BaseModel):
-    cuisine: str
-    location: str
-    price_range: str | None = None
-    dietary: str | None = None
+# Load embedding model
+MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
-def generate_restaurant_response(query: Query):
-    prompt = f"""
-    You are a restaurant recommendation agent.
+# Overpass API client
+api = overpy.Overpass()
 
-    User preferences:
-    - Cuisine: {query.cuisine}
-    - Location: {query.location}
-    - Price range: {query.price_range}
-    - Dietary needs: {query.dietary}
+# Global variables
+restaurants = []
+index = None
+vecs = None
 
-    Provide:
-    - 3 restaurant recommendations
-    - A short description for each
-    - Why it matches the user's preferences
+# Haversine distance (km)
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return R * 2 * math.asin(math.sqrt(a))
+
+# Load restaurants from OpenStreetMap
+def load_osm():
+    global restaurants, index, vecs
+
+    query = """
+    [out:json][timeout:25];
+    area["name"="Coventry"]->.a;
+    (
+      node["amenity"="restaurant"](area.a);
+      way["amenity"="restaurant"](area.a);
+      relation["amenity"="restaurant"](area.a);
+    );
+    out center tags;
     """
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
-    )
+    result = api.query(query)
 
-    return response.choices[0].message.content
+    restaurants = []
 
+    # Extract nodes
+    for n in result.nodes:
+        name = n.tags.get("name", "Unknown")
+        cuisine = n.tags.get("cuisine", "")
+        lat, lon = float(n.lat), float(n.lon)
+        restaurants.append({"name": name, "cuisine": cuisine, "lat": lat, "lon": lon})
+
+    # Extract ways (use center)
+    for w in result.ways:
+        name = w.tags.get("name", "Unknown")
+        cuisine = w.tags.get("cuisine", "")
+        lat, lon = float(w.center_lat), float(w.center_lon)
+        restaurants.append({"name": name, "cuisine": cuisine, "lat": lat, "lon": lon})
+
+    # Extract relations (use center)
+    for r in result.relations:
+        name = r.tags.get("name", "Unknown")
+        cuisine = r.tags.get("cuisine", "")
+        lat, lon = float(r.center_lat), float(r.center_lon)
+        restaurants.append({"name": name, "cuisine": cuisine, "lat": lat, "lon": lon})
+
+    # Build embeddings
+    texts = [f"{r['name']} {r['cuisine']}" for r in restaurants]
+    vecs = MODEL.encode(texts, convert_to_numpy=True)
+
+    # Build FAISS index
+    index = faiss.IndexFlatL2(vecs.shape[1])
+    index.add(vecs)
+
+@app.on_event("startup")
+def startup_event():
+    load_osm()
 
 @app.post("/recommend")
-def recommend_restaurants(query: Query):
-    result = generate_restaurant_response(query)
-    return {"recommendations": result}
+def recommend(
+    lat: float = Form(...),
+    lon: float = Form(...),
+    cuisine: str = Form(""),
+    vibe: str = Form("")
+):
+    if index is None:
+        raise HTTPException(503, "Index not ready")
+
+    # Build query embedding
+    qtext = f"{cuisine} {vibe}"
+    qvec = MODEL.encode([qtext])
+
+    # Search top 10 matches
+    D, I = index.search(qvec, 10)
+
+    results = []
+    for i in I[0][:5]:
+        r = restaurants[i]
+        d = haversine(lat, lon, r["lat"], r["lon"])
+        results.append({
+            "name": r["name"],
+            "cuisine": r["cuisine"],
+            "distance_km": round(d, 2)
+        })
+
+    return {"results": results}
