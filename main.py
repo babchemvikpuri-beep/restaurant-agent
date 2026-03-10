@@ -74,7 +74,13 @@ def load_osm():
 
 @app.on_event("startup")
 def startup_event():
+    pass
+    # load_osm()
+
+@app.get("/load")
+def load():
     load_osm()
+    return {"status": "OSM + embeddings loaded"}
 
 @app.post("/recommend")
 def recommend(
@@ -104,3 +110,4 @@ def recommend(
         })
 
     return {"results": results}
+
